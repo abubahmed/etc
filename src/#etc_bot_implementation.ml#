@@ -1,0 +1,263 @@
+open! Core
+open Async
+open Import
+
+module Order = struct
+  type t =
+    { order_id : Order_id.t
+    ; symbol : Symbol.t
+    ; dir : Dir.t
+    ; size : Size.t
+    }
+  [@@deriving sexp_of]
+
+  let create order_id symbol dir size = { order_id; symbol; dir; size }
+end
+
+module State = struct
+  type t =
+    { positions : Position.t Symbol.Table.t
+    ; order_id_generator : Order_id_generator.t
+    ; exchange_driver : Exchange_driver.t
+    ; unacked_orders : Order.t Order_id.Table.t
+    ; open_orders : Order.t Order_id.Table.t
+    ; fully_filled_orders : Order_id.Hash_set.t
+    ; pending_cancels : Order_id.Hash_set.t
+    ; canceled_orders : Order_id.Hash_set.t
+    ; mutable last_debug_info_printed : string
+    }
+
+  let create exchange_driver =
+    { positions = Symbol.Table.create ()
+    ; order_id_generator = Order_id_generator.create ()
+    ; exchange_driver
+    ; unacked_orders = Order_id.Table.create ()
+    ; open_orders = Order_id.Table.create ()
+    ; fully_filled_orders = Order_id.Hash_set.create ()
+    ; pending_cancels = Order_id.Hash_set.create ()
+    ; canceled_orders = Order_id.Hash_set.create ()
+    ; last_debug_info_printed = ""
+    }
+  ;;
+
+  let on_hello t positions =
+    List.iter positions ~f:(fun (symbol, position) ->
+      Hashtbl.add_exn t.positions ~key:symbol ~data:position);
+    Core.printf !"Initial positions:\n%{sexp: Position.t Symbol.Table.t}\n%!" t.positions
+  ;;
+
+  let next_id t = Order_id_generator.next_id t.order_id_generator
+
+  let add_order' t symbol dir ~price ~size =
+    let order_id = next_id t in
+    let size = Size.of_int_exn size in
+    let order = Order.create order_id symbol dir size in
+    Hashtbl.set t.unacked_orders ~key:order_id ~data:order;
+    let%bind () =
+      Exchange_driver.add_order
+        t.exchange_driver
+        ~symbol
+        ~dir
+        ~price:(Price.of_int_exn price)
+        ~size
+        ~order_id
+    in
+    return order_id
+  ;;
+
+  let add_order t symbol dir ~price ~size =
+    let%bind _ = add_order' t symbol dir ~price ~size in
+    return ()
+  ;;
+
+  let cancel_order t order_id =
+    Hash_set.add t.pending_cancels order_id;
+    Exchange_driver.cancel t.exchange_driver ~order_id
+  ;;
+
+  let on_fill t fill =
+    (* Update positions *)
+    let { order_id; symbol; dir; price = _; size } : Exchange_message.Fill.t = fill in
+    let fill_size = Size.to_int size in
+    let prev_position = Hashtbl.find_exn t.positions symbol in
+    let direction_mult =
+      match dir with
+      | Buy -> 1
+      | Sell -> -1
+    in
+    let new_position =
+      Position.to_int prev_position + (direction_mult * fill_size) |> Position.of_int_exn
+    in
+    Hashtbl.set t.positions ~key:symbol ~data:new_position;
+    (* Update open orders *)
+    let prev_open_order = Hashtbl.find_exn t.open_orders order_id in
+    let new_open_order_size = Size.to_int prev_open_order.Order.size - fill_size in
+    match Int.equal new_open_order_size 0 with
+    | true -> () (* wait for exchange OUT confirmation to remove from open_orders *)
+    | false ->
+      let data : Order.t =
+        { prev_open_order with size = Size.of_int_exn new_open_order_size }
+      in
+      Hashtbl.set t.open_orders ~key:order_id ~data
+  ;;
+
+  let on_ack t order_id =
+    let order_data = Hashtbl.find_exn t.unacked_orders order_id in
+    Hashtbl.remove t.unacked_orders order_id;
+    Hashtbl.set t.open_orders ~key:order_id ~data:order_data;
+    Core.printf !"Order_id ack: %{sexp: Order_id.t}\n%!" order_id
+  ;;
+
+  let on_out t order_id =
+    let () =
+      match Hash_set.mem t.pending_cancels order_id with
+      | true ->
+        Core.printf !"Successfully canceled order: %{sexp: Order_id.t}\n%!" order_id;
+        Hash_set.remove t.pending_cancels order_id;
+        Hash_set.add t.canceled_orders order_id
+      | false ->
+        Core.printf !"Order is fully-filled and out: %{sexp: Order_id.t}\n%!" order_id;
+        Hash_set.add t.fully_filled_orders order_id
+    in
+    Hashtbl.remove t.open_orders order_id
+  ;;
+
+  (* [State.print_debug_info state] -> prints debug information
+     [State.print_debug_info state ~only_if_changed:()] -> prints debug information if it
+     has changed since the last print event *)
+  let print_debug_info ?only_if_changed t =
+    let next_debug_info =
+      String.concat
+        [ Core.sprintf !"Positions:\n%{sexp: Position.t Symbol.Table.t}\n%!" t.positions
+        ; Core.sprintf
+            !"Open orders:\n%{sexp: Order.t Order_id.Table.t}\n%!"
+            t.open_orders
+        ]
+    in
+    let should_print =
+      Option.is_none (only_if_changed : unit option)
+      || not (String.equal next_debug_info t.last_debug_info_printed)
+    in
+    match should_print with
+    | true ->
+      t.last_debug_info_printed <- next_debug_info;
+      Core.printf !"%s%!" next_debug_info
+    | false -> ()
+  ;;
+end
+
+module Bond_strategy = struct
+  (* All order_ids that this BOND strategy has ever used *)
+  let seen_order_ids = Order_id.Hash_set.create ()
+
+  (* If our current position is:
+   *  +100: we can SELL 200 but can't buy any more
+   *   +50: we can BUY  50 or SELL 150
+   *     0: we can BUY 100 or SELL 100
+   *   -50: we can BUY 150 or SELL  50
+   *  -100: we can BUY 200 but can't sell any more
+  *)
+  let initialize_bond_orders state =
+    let bond_position =
+      Hashtbl.find_exn state.State.positions Symbol.bond |> Position.to_int
+    in
+    let position_limit = 5 in
+    let buy_order_size = position_limit - bond_position in
+    let sell_order_size = -(-position_limit - bond_position) in
+    let maybe_add_order dir ~size ~price =
+      match size > 0 with
+      | false -> return ()
+      | true ->
+        let%bind order_id = State.add_order' state Symbol.bond dir ~size ~price in
+        Hash_set.add seen_order_ids order_id;
+        Core.printf
+          !"  Placed BOND %{sexp: Dir.t} order id=%{sexp: Order_id.t} with size=%{sexp: \
+            Int.t}\n\
+            %!"
+          dir
+          order_id
+          size;
+        return ()
+    in
+    Core.printf
+      !"Updating BOND strategy orders. Current position: %{sexp: Int.t}\n%!"
+      bond_position;
+    let%bind () = maybe_add_order Dir.Buy ~price:999 ~size:buy_order_size in
+    let%bind () = maybe_add_order Dir.Sell ~price:1001 ~size:sell_order_size in
+    return ()
+  ;;
+
+  let reset_all_bond_orders state =
+    Core.print_endline "Canceling bond orders";
+    Hashtbl.keys state.State.open_orders
+    |> Deferred.List.iter ~how:`Parallel ~f:(fun order_id ->
+      State.cancel_order state order_id)
+  ;;
+
+  (* If the OUT was a fully-filled order_id associated with this strategy, then replenish
+     the strategy orders. If the OUT was due to a cancel, or due to fills outside of this
+     strategy, then do nothing. *)
+  let on_out_maybe_replace_bond_orders state order_id =
+    let is_fully_filled = Hash_set.mem state.State.fully_filled_orders order_id in
+    let is_bond_strategy_order = Hash_set.mem seen_order_ids order_id in
+    match is_fully_filled && is_bond_strategy_order with
+    | false -> return ()
+    | true ->
+      let%bind () = reset_all_bond_orders state in
+      let%bind () = initialize_bond_orders state in
+      return ()
+  ;;
+end
+
+(* [run_every seconds ~f] is a utility function that will run a given
+   function, [f], every [num_seconds] seconds. *)
+let run_every seconds ~f = Clock_ns.every (Time_ns.Span.of_sec seconds) f
+
+let read_messages_and_do_some_stuff exchange_driver exchange_messages state =
+  (* Be careful not do too many things inside of [f], otherwise you can fall behind the
+     production exchange. We will not see the next message until each call to [f:
+     Exchange_messate.t -> unit Deferred.t] becomes determined.
+
+     You should maintain an average of sending less than 1 order per exchange message. In
+     the example below, on FILL we cancel at most 2 orders and re-send at most 2, but
+     otherwise essentially do nothing inside of [f] beyond state tracking. *)
+  Async.Pipe.iter exchange_messages ~f:(fun message ->
+    match (message : Exchange_message.t) with
+    | Hello positions ->
+      State.on_hello state positions;
+      Bond_strategy.initialize_bond_orders state
+    | Fill fill ->
+      State.on_fill state fill;
+      return ()
+    | Ack order_id ->
+      State.on_ack state order_id;
+      return ()
+    | Out order_id ->
+      State.on_out state order_id;
+      Bond_strategy.on_out_maybe_replace_bond_orders state order_id
+    | Open _ | Reject _ | Error _ | Close _ ->
+      Core.printf !"%{sexp: Exchange_message.t}\n%!" message;
+      return ()
+    | Book _ | Trade _ ->
+      (* Ignore these messages (for now) because they are noisy on busy exchanges. *)
+      return ())
+;;
+
+let run exchange_type =
+  (* Set up a connection to the exchange. *)
+  Exchange_driver.connect_and_run
+    exchange_type
+    ~f:(fun ~exchange_driver ~exchange_messages ->
+      let state = State.create exchange_driver in
+      (* Frequently try to print new debug information in case it has changed *)
+      run_every 1. ~f:(fun () -> State.print_debug_info state);
+      read_messages_and_do_some_stuff exchange_driver exchange_messages state)
+;;
+
+let command =
+  Async.Command.async
+    ~summary:"My etc bot"
+    [%map_open.Command
+      let exchange_type = Exchange_type.param in
+      fun () -> run exchange_type]
+;;

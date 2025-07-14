@@ -1,0 +1,50 @@
+open! Core
+open Async
+open Import
+
+module Symbol = struct
+  include Symbol
+  include Comparable.Make (Symbol)
+end
+
+module State = struct
+  type t = { mutable positions : Position.t Symbol.Map.t }
+
+  let create () = { positions = Symbol.Map.empty }
+  let next_id t = ()
+  let new_order t ~symbol ~dir ~price ~size = ()
+
+  let on_hello t positions =
+    t.positions <- Symbol.Map.of_alist_exn positions;
+    Core.printf !"%{sexp: Position.t Symbol.Map.t}\n%!" t.positions
+  ;;
+
+  let on_ack t message = ()
+  let on_fill t message = ()
+end
+
+let read_messages_and_do_some_stuff exchange_driver exchange_messages state =
+  Async.Pipe.iter_without_pushback exchange_messages ~f:(fun message ->
+    match (message : Exchange_message.t) with
+    | Hello positions -> State.on_hello state positions
+    | _ ->
+      (* Ignore all other messages (for now) *)
+      ())
+;;
+
+let run exchange_type =
+  (* Set up a connection to the exchange. *)
+  Exchange_driver.connect_and_run
+    exchange_type
+    ~f:(fun ~exchange_driver ~exchange_messages ->
+      let state = State.create () in
+      read_messages_and_do_some_stuff exchange_driver exchange_messages state)
+;;
+
+let command =
+  Async.Command.async
+    ~summary:"My etc bot"
+    [%map_open.Command
+      let exchange_type = Exchange_type.param in
+      fun () -> run exchange_type]
+;;
