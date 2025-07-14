@@ -2,6 +2,17 @@ open! Core
 open  Async
 open  Import
 
+module State = struct
+  type t = { mutable positions : Position.t Symbol.Map.t } [@@deriving sexp]
+
+  let create () = { positions = Symbol.Map.empty }
+  let next_id t = ()
+  let add_order t ~symbol ~dir ~price ~size = ()
+  let on_hello t hello_message = ()
+  let on_ack t order_id = ()
+  let on_fill t fill = ()
+end
+
 (* [run_every seconds ~f] is a utility function that will run a given function, [f], every
    [num_seconds] seconds. *)
 let run_every seconds ~f = Async.Clock.every (Time_float.Span.of_sec seconds) f
@@ -41,6 +52,7 @@ let run exchange_type =
                 This is probably not a good order to send (do you understand
                 why?), and is just an example to show how you can send an
                 order to the exchange. *)
+              
              let order_id = Order_id_generator.next_id order_id_generator in
              Exchange_driver.add_order
                exchange_driver
